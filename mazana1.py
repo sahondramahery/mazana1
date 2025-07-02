@@ -7,7 +7,7 @@ from statistics import mean
 # ------------------------- CONFIGURATION -------------------------
 
 CONFIG = {
-    "APP_ID": 71130,
+    "APP_ID": 76510,
     "INITIAL_STAKE": 0.35,
     "MARTINGALE_MULTIPLIER": 3,
     "GRANULARITY": 1800,  # 30 minutes
@@ -26,7 +26,7 @@ CONFIG = {
 # ------------------------- ACCOUNTS CONFIG -------------------------
 
 ACCOUNTS = [
-    {"token": "REzKac9b5BR7DmF", "role": "master"},
+    {"token": "LDG7hjLbnbK6dRu", "role": "master"},
     {"token": "TOKEN_FOLLOWER1", "role": "follower"},
     {"token": "TOKEN_FOLLOWER2", "role": "follower"},
 ]
