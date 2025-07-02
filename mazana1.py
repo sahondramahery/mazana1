@@ -10,7 +10,7 @@ CONFIG = {
     "APP_ID": 76510,
     "INITIAL_STAKE": 0.35,
     "MARTINGALE_MULTIPLIER": 3,
-    "GRANULARITY": 1800,  # 30 minutes
+    "GRANULARITY": 600,  # 10 minutes
     "MIN_CANDLES_REQUIRED": 30,
     "VOLATILITY_THRESHOLD": 0.5,
     "SYMBOLS": ["R_10", "R_25", "R_50", "R_75", "R_100"],
@@ -80,7 +80,7 @@ class SymbolSingleAccount:
                 "basis": "stake",
                 "contract_type": signal,
                 "currency": "USD",
-                "duration": 60,
+                "duration": 20,
                 "duration_unit": "m",
                 "symbol": self.symbol
             })
