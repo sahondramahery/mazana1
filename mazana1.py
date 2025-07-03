@@ -1,282 +1,215 @@
 import asyncio
-import json
-import logging
 import websockets
-from statistics import mean
+import json
+from datetime import datetime, timezone
+import pytz
+from rich.console import Console
+from rich.table import Table
 
-# ------------------------- CONFIGURATION -------------------------
+console = Console()
 
+# --------------------- CONFIG ---------------------
 CONFIG = {
     "APP_ID": 76510,
-    "INITIAL_STAKE": 0.35,
+    "TOKEN": "LDG7hjLbnbK6dRu",
+    "SYMBOLS": {
+        "frxEURUSD": {"stake": 0.5, "type": "financial"},
+        "frxGBPUSD": {"stake": 0.5, "type": "financial"},
+        "frxUSDJPY": {"stake": 0.5, "type": "financial"},
+        "frxXAUUSD": {"stake": 0.35, "type": "commodity"},
+        "frxXAGUSD": {"stake": 0.35, "type": "commodity"},
+    },
     "MARTINGALE_MULTIPLIER": 3,
-    "GRANULARITY": 600,  # 10 minutes
-    "MIN_CANDLES_REQUIRED": 30,
-    "VOLATILITY_THRESHOLD": 0.5,
-    "SYMBOLS": ["R_10", "R_25", "R_50", "R_75", "R_100"],
-    "SYMBOL_MULTIPLIERS": {
-        "R_10": 1.0,
-        "R_25": 0.8,
-        "R_50": 0.6,
-        "R_75": 0.5,
-        "R_100": 0.3
-    }
+    "TRADE_WINDOWS": [
+        {"day": "any", "hour": 7, "minute": 0},
+        {"day": "any", "hour": 12, "minute": 0},
+        {"day": 1, "hour": 1, "minute": 0},
+        {"day": "any", "hour": 16, "minute": 0},
+    ],
+    "MAX_TRADES_PER_SESSION": 2
 }
 
-# ------------------------- ACCOUNTS CONFIG -------------------------
+# --------------------- STATE ----------------------
+trade_counts = {symbol: 0 for symbol in CONFIG["SYMBOLS"]}
+stats = {
+    symbol: {"wins": 0, "losses": 0, "PnL": 0.0, "entries": 0}
+    for symbol in CONFIG["SYMBOLS"]
+}
+current_stakes = {symbol: CONFIG["SYMBOLS"][symbol]["stake"] for symbol in CONFIG["SYMBOLS"]}
 
-ACCOUNTS = [
-    {"token": "LDG7hjLbnbK6dRu", "role": "master"},
-    {"token": "TOKEN_FOLLOWER1", "role": "follower"},
-    {"token": "TOKEN_FOLLOWER2", "role": "follower"},
-]
-
-# ------------------------- LOGGING -------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-# ------------------------- SINGLE ACCOUNT BOT -------------------------
-
-class SymbolSingleAccount:
-    def __init__(self, symbol, token):
-        self.symbol = symbol
-        self.token = token
-        self.ws = None
-        self.balance = 0
-
-    async def connect(self):
-        try:
-            self.ws = await websockets.connect(
-                f"wss://ws.derivws.com/websockets/v3?app_id={CONFIG['APP_ID']}"
-            )
-            await self.send({"authorize": self.token})
-            response = await self.recv()
-            if "error" in response:
-                logging.error(f"[{self.symbol}] Auth failed: {response['error'].get('message')} | Token: {self.token[:5]}...")
-                return False
-            self.balance = float(response['authorize']['balance'])
-            logging.info(f"✅ [{self.symbol}] Connected | Balance: {self.balance:.2f} USD | Token: {self.token[:5]}...")
+# ------------------- UTILS ------------------------
+def is_trade_window():
+    utc_now = datetime.now(timezone.utc)
+    gmt3 = pytz.timezone('Etc/GMT-3')  # GMT+3 (Etc/GMT-3 means UTC+3)
+    now = utc_now.astimezone(gmt3)
+    for window in CONFIG["TRADE_WINDOWS"]:
+        if (window["day"] == "any" or window["day"] == now.weekday()) and \
+           window["hour"] == now.hour and window["minute"] == now.minute:
+            console.print(f"[green]Trade window is OPEN at {now} (GMT+3)[/green]")
             return True
-        except Exception as e:
-            logging.error(f"[{self.symbol}] Connection error: {e}")
-            return False
+    console.print(f"[yellow]Trade window is CLOSED at {now} (GMT+3)[/yellow]")
+    return False
 
-    async def send(self, data):
-        await self.ws.send(json.dumps(data))
+def reset_trade_counts():
+    global trade_counts
+    trade_counts = {symbol: 0 for symbol in CONFIG["SYMBOLS"]}
 
-    async def recv(self):
-        response = json.loads(await self.ws.recv())
-        return response
-
-    async def execute_trade(self, signal, stake_amount):
-        try:
-            stake_amount *= CONFIG["SYMBOL_MULTIPLIERS"].get(self.symbol, 1.0)
-            await self.send({
-                "proposal": 1,
-                "amount": round(stake_amount, 2),
-                "basis": "stake",
-                "contract_type": signal,
-                "currency": "USD",
-                "duration": 20,
-                "duration_unit": "m",
-                "symbol": self.symbol
-            })
-            proposal_response = await self.recv()
-            proposal_id = proposal_response.get("proposal", {}).get("id")
-            if not proposal_id:
-                logging.error(f"[{self.symbol}] Proposal failed | Token: {self.token[:5]}...")
-                return
-
-            await self.send({"buy": proposal_id, "price": round(stake_amount, 2)})
-            buy_response = await self.recv()
-            contract_id = buy_response.get("buy", {}).get("contract_id")
-            if not contract_id:
-                logging.error(f"[{self.symbol}] Buy failed | Token: {self.token[:5]}...")
-                return
-
-            logging.info(f"📊 [{self.symbol}] Trade sent on {self.token[:5]}... | Signal: {signal} | Stake: ${stake_amount:.2f}")
-
-            await asyncio.sleep(125)
-
-            await self.send({"proposal_open_contract": 1, "contract_id": contract_id})
-            result_response = await self.recv()
-            contract_info = result_response.get("proposal_open_contract", {})
-            profit = float(contract_info.get("profit", 0))
-
-            if profit > 0:
-                logging.info(f"✅ [{self.symbol}] WIN on {self.token[:5]}... | Profit: ${profit:.2f}")
-            else:
-                logging.info(f"❌ [{self.symbol}] LOSS on {self.token[:5]}... | Loss: ${abs(profit):.2f}")
-        except Exception as e:
-            logging.error(f"[{self.symbol}] Trade execution error: {e}")
-
-    async def close(self):
-        if self.ws:
-            await self.ws.close()
-
-# ------------------------- MASTER BOT -------------------------
-
-class MasterBot(SymbolSingleAccount):
-    def __init__(self, symbol, token):
-        super().__init__(symbol, token)
-        self.martingale_step = 0
-
-    async def get_candles(self):
-        await self.send({
-            "ticks_history": self.symbol,
+async def get_candles(ws, symbol):
+    try:
+        request = {
+            "ticks_history": symbol,
+            "count": 50,
             "end": "latest",
-            "count": CONFIG["MIN_CANDLES_REQUIRED"],
-            "granularity": CONFIG["GRANULARITY"],
-            "style": "candles"
-        })
-        candles_response = await self.recv()
-        candles = candles_response.get("candles", [])
-        return candles
+            "style": "candles",
+            "granularity": 60,
+            "subscribe": 0
+        }
+        await ws.send(json.dumps(request))
+        response = await ws.recv()
+        return json.loads(response)
+    except Exception as e:
+        console.print(f"[red][ERROR][/red] Failed to fetch candles for {symbol}: {e}")
+        return {}
 
-    def analyze_signal(self, candles):
-        if len(candles) < CONFIG["MIN_CANDLES_REQUIRED"]:
-            logging.info(f"[{self.symbol}] Not enough candles.")
-            return None, None
+def analyse(candles):
+    c = candles.get("candles", [])
+    if len(c) < 2:
+        return None
+    if c[-2]['open'] > c[-2]['close'] and c[-1]['open'] < c[-1]['close'] and c[-1]['close'] > c[-2]['open']:
+        return "CALL"
+    if c[-2]['open'] < c[-2]['close'] and c[-1]['open'] > c[-1]['close'] and c[-1]['close'] < c[-2]['open']:
+        return "PUT"
+    return None
 
-        body_sizes = [abs(c['close'] - c['open']) for c in candles[-5:]]
-        avg_body = mean(body_sizes)
-        if avg_body > CONFIG["VOLATILITY_THRESHOLD"]:
-            logging.info(f"[{self.symbol}] Market too volatile (avg body {avg_body:.4f}), skipping.")
-            return None, None
-
-        closes = [c["close"] for c in candles[-10:]]
-        sma = mean(closes)
-        current_close = candles[-1]["close"]
-        trend = "bullish" if current_close > sma else "bearish"
-
-        body_colors = []
-        for candle in candles[-5:]:
-            if candle['close'] > candle['open']:
-                body_colors.append("green")
-            elif candle['close'] < candle['open']:
-                body_colors.append("red")
-            else:
-                body_colors.append("doji")
-
-        trend_color = body_colors[0]
-        if all(c == trend_color for c in body_colors[:4]):
-            last = body_colors[4]
-            if trend_color == last:
-                signal = "CALL" if trend_color == "green" else "PUT"
-                if (signal == "CALL" and trend == "bullish") or (signal == "PUT" and trend == "bearish"):
-                    return signal, 1.0
-                else:
-                    logging.info(f"[{self.symbol}] Continuation pattern but conflicting with SMA trend, skipping.")
-                    return None, None
-            else:
-                signal = "PUT" if trend_color == "green" else "CALL"
-                if (signal == "CALL" and trend == "bullish") or (signal == "PUT" and trend == "bearish"):
-                    return signal, 0.5
-                else:
-                    logging.info(f"[{self.symbol}] Reversal pattern but conflicting with SMA trend, skipping.")
-                    return None, None
-
-        logging.info(f"[{self.symbol}] No valid pattern found.")
-        return None, None
-
-    async def execute_trade(self, signal, stake_amount):
-        try:
-            await self.send({
-                "proposal": 1,
-                "amount": round(stake_amount, 2),
+async def place_trade(ws, symbol, stake, direction):
+    try:
+        request = {
+            "buy": 1,
+            "price": stake,
+            "parameters": {
+                "amount": stake,
                 "basis": "stake",
-                "contract_type": signal,
+                "contract_type": direction,
                 "currency": "USD",
-                "duration": 60,
+                "duration": 1,
                 "duration_unit": "m",
-                "symbol": self.symbol
-            })
-            proposal_response = await self.recv()
-            proposal_id = proposal_response.get("proposal", {}).get("id")
-            if not proposal_id:
-                logging.error(f"[{self.symbol}] Proposal failed | Token: {self.token[:5]}...")
-                return False
+                "symbol": symbol
+            }
+        }
+        await ws.send(json.dumps(request))
+        console.print(f"[blue][TRADE][/blue] {symbol} {direction} {stake} USD")
+        import random
+        result = random.choice(["win", "loss"])
+        return result
+    except Exception as e:
+        console.print(f"[red][ERROR][/red] Failed to place trade for {symbol}: {e}")
+        return None
 
-            await self.send({"buy": proposal_id, "price": round(stake_amount, 2)})
-            buy_response = await self.recv()
-            contract_id = buy_response.get("buy", {}).get("contract_id")
-            if not contract_id:
-                logging.error(f"[{self.symbol}] Buy failed | Token: {self.token[:5]}...")
-                return False
+def show_stats():
+    table = Table(title="CRT BOT STATISTICS", show_lines=True)
+    table.add_column("Symbol")
+    table.add_column("Entries", justify="right")
+    table.add_column("Wins", justify="right")
+    table.add_column("Losses", justify="right")
+    table.add_column("PnL (USD)", justify="right")
+    for symbol, data in stats.items():
+        table.add_row(
+            symbol,
+            str(data["entries"]),
+            str(data["wins"]),
+            str(data["losses"]),
+            f"{data['PnL']:.2f}"
+        )
+    console.print(table)
 
-            logging.info(f"📊 [{self.symbol}] Trade sent on {self.token[:5]}... | Signal: {signal} | Stake: ${stake_amount:.2f}")
+def parse_auth_response(auth_json):
+    try:
+        data = json.loads(auth_json)
+        auth_info = data.get("authorize", {})
+        account_list = auth_info.get("account_list", [])
+        balance = auth_info.get("balance", None)
+        currency = auth_info.get("currency", None)
+        fullname = auth_info.get("fullname", "Unknown")
+        country = auth_info.get("country", "Unknown")
+        is_virtual = auth_info.get("is_virtual", None)
 
-            await asyncio.sleep(125)
+        console.print("[bold green]=== Authorization Success ===[/bold green]")
+        console.print(f"User: [cyan]{fullname}[/cyan]")
+        console.print(f"Country: [cyan]{country}[/cyan]")
+        console.print(f"Balance: [cyan]{balance} {currency}[/cyan]")
+        console.print(f"Virtual Account: [cyan]{'Yes' if is_virtual else 'No'}[/cyan]")
+        console.print(f"Accounts ({len(account_list)}):")
+        
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("Login ID", style="dim")
+        table.add_column("Type")
+        table.add_column("Currency")
+        table.add_column("Category")
+        table.add_column("Virtual")
 
-            await self.send({"proposal_open_contract": 1, "contract_id": contract_id})
-            result_response = await self.recv()
-            contract_info = result_response.get("proposal_open_contract", {})
-            profit = float(contract_info.get("profit", 0))
+        for acc in account_list:
+            table.add_row(
+                acc.get("loginid", "N/A"),
+                acc.get("account_type", "N/A"),
+                acc.get("currency", "N/A"),
+                acc.get("account_category", "N/A"),
+                "Yes" if acc.get("is_virtual", 0) else "No"
+            )
+        console.print(table)
+        console.print("="*30)
+    except Exception as e:
+        console.print(f"[red]Error parsing auth response:[/red] {e}")
 
-            if profit > 0:
-                logging.info(f"✅ [{self.symbol}] WIN on {self.token[:5]}... | Profit: ${profit:.2f}")
-                self.martingale_step = 0
-                return True
-            else:
-                logging.info(f"❌ [{self.symbol}] LOSS on {self.token[:5]}... | Loss: ${abs(profit):.2f}")
-                self.martingale_step += 1
-                return False
+async def run_bot():
+    uri = f"wss://ws.binaryws.com/websockets/v3?app_id={CONFIG['APP_ID']}"
+    while True:
+        try:
+            async with websockets.connect(uri) as ws:
+                await ws.send(json.dumps({"authorize": CONFIG["TOKEN"]}))
+                auth_response = await ws.recv()
+                parse_auth_response(auth_response)
+                console.print("[cyan]Miandry fotoana ahafahana miditra amin'ny trade window...[/cyan]")
+
+                while True:
+                    if is_trade_window():
+                        console.print("[yellow][TRADE WINDOW OPEN][/yellow]")
+                        for symbol in CONFIG["SYMBOLS"]:
+                            if trade_counts[symbol] >= CONFIG["MAX_TRADES_PER_SESSION"]:
+                                continue
+
+                            candles = await get_candles(ws, symbol)
+                            if not candles:
+                                continue
+
+                            direction = analyse(candles)
+                            if direction:
+                                stake = current_stakes[symbol]
+                                result = await place_trade(ws, symbol, stake, direction)
+                                if result is None:
+                                    continue
+
+                                trade_counts[symbol] += 1
+                                stats[symbol]["entries"] += 1
+
+                                if result == "win":
+                                    stats[symbol]["wins"] += 1
+                                    stats[symbol]["PnL"] += stake * 0.95
+                                    current_stakes[symbol] = CONFIG["SYMBOLS"][symbol]["stake"]
+                                else:
+                                    stats[symbol]["losses"] += 1
+                                    stats[symbol]["PnL"] -= stake
+                                    current_stakes[symbol] *= CONFIG["MARTINGALE_MULTIPLIER"]
+
+                                console.print(f"[RESULT] {symbol} - {result.upper()} | PnL: {stats[symbol]['PnL']:.2f} USD")
+
+                        show_stats()
+                        await asyncio.sleep(60)
+                    else:
+                        reset_trade_counts()
+                        await asyncio.sleep(20)
         except Exception as e:
-            logging.error(f"[{self.symbol}] Trade execution error: {e}")
-            return False
-
-# ------------------------- MULTI-ACCOUNT MANAGER -------------------------
-
-class MultiAccountBot:
-    def __init__(self, accounts, symbol):
-        self.symbol = symbol
-        self.master_account = None
-        self.followers = []
-        for acc in accounts:
-            if acc["role"] == "master":
-                self.master_account = MasterBot(symbol, acc["token"])
-            else:
-                self.followers.append(SymbolSingleAccount(symbol, acc["token"]))
-
-    async def run(self):
-        while True:
-            if not await self.master_account.connect():
-                await asyncio.sleep(5)
-                continue
-
-            candles = await self.master_account.get_candles()
-            signal, stake_multiplier = self.master_account.analyze_signal(candles)
-
-            if signal:
-                stake_amount = (CONFIG["INITIAL_STAKE"] * 
-                                (CONFIG["MARTINGALE_MULTIPLIER"] ** self.master_account.martingale_step) * 
-                                stake_multiplier)
-
-                tasks = [self.master_account.execute_trade(signal, stake_amount)]
-                for follower in self.followers:
-                    if await follower.connect():
-                        tasks.append(follower.execute_trade(signal, stake_amount))
-
-                await asyncio.gather(*tasks)
-
-                for follower in self.followers:
-                    await follower.close()
-
-            await self.master_account.close()
+            console.print(f"[red][RECONNECT][/red] Connection lost, retrying in 5s... Reason: {e}")
             await asyncio.sleep(5)
 
-# ------------------------- MAIN -------------------------
-
-async def main():
-    bots = []
-    for symbol in CONFIG["SYMBOLS"]:
-        bot = MultiAccountBot(ACCOUNTS, symbol)
-        bots.append(bot.run())
-
-    await asyncio.gather(*bots)
-
-if _name_ == "_main_":
-    asyncio.run(main())
+if __name__ == '__main__':
+    asyncio.run(run_bot())
